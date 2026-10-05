@@ -14,7 +14,9 @@
 3. 幂等冻结：相同内容重复提交/读取返回同一 content_hash；
 4. 冲突：同一审计标识不同内容 -> 409 且原裁决不变；
 5. 队列增长拒绝：提交不可收敛场景，校验 NON_CONVERGENT 与连续增长链；
-6. 输入校验失败返回 400。
+6. 输入校验失败返回 400；
+7. 实例等待链：区间连续无重叠、阻塞类别分段不合并、关联帧流与释放时刻、
+   不存在实例 404、查询后冻结结果不变。
 任一断言失败以非零退出码退出。
 """
 
@@ -179,6 +181,41 @@ def run_smoke(base: str) -> None:
           and isinstance(body7, dict) and body7.get("error") == "VALIDATION_FAILED")
     status, body8 = request("GET", base + "/api/decisions/NO-SUCH-ID")
     check("读取不存在裁决 -> 404", status == 404)
+
+    print("[7] 实例等待链（按时间连续、无重叠的逐段归因）")
+    status, w = request("GET", base + "/api/decisions/SMK-CARRY-001/waits/LO/0")
+    check("查询 LO#0 等待链 -> 200", status == 200, f"status={status} body={w}")
+    if status == 200 and isinstance(w, dict):
+        check("等待链随原冻结裁决返回（哈希一致）", w.get("content_hash") == frozen_hash)
+        wait = w["wait"]
+        intervals = wait["intervals"]
+        contiguous = all(a["to"] == b["from"] for a, b in zip(intervals, intervals[1:]))
+        check("等待区间连续无重叠",
+              contiguous and intervals[0]["from"] == wait["from"]
+              and intervals[-1]["to"] == wait["to"],
+              str(intervals))
+        check("LO#0 等待覆盖 [0, 1000) 至开始发送",
+              wait["from"] == 0 and wait["to"] == 1000, str(wait))
+        kinds = [s["blocker"] for s in intervals]
+        check("高优先级占用与门关闭分段呈现、不合并",
+          "higher_priority_tx" in kinds and "gate_closed" in kinds, str(kinds))
+        hp = next(s for s in intervals if s["blocker"] == "higher_priority_tx")
+        check("占用段标明关联帧的流与释放时刻",
+              hp["source"]["frame"] == "HI#0" and hp["source"]["flow_id"] == "HI"
+              and hp["source"]["release"] == 0, str(hp))
+        check("每段含队列长度/门状态/可发送最高优先级",
+              all({"queue_length", "gate_open", "eligible_priority"} <= set(s)
+                  for s in intervals))
+    status, w2 = request("GET", base + "/api/decisions/SMK-CARRY-001/waits/LO/99")
+    check("不存在的实例 -> 404 INSTANCE_NOT_FOUND",
+          status == 404 and isinstance(w2, dict)
+          and w2.get("error") == "INSTANCE_NOT_FOUND")
+    status, w3 = request("GET", base + "/api/decisions/NO-SUCH-ID/waits/LO/0")
+    check("不存在的裁决 -> 404", status == 404)
+    status, after = request("GET", base + "/api/decisions/SMK-CARRY-001")
+    check("等待链查询后冻结裁决不变",
+          isinstance(after, dict) and after.get("content_hash") == frozen_hash
+          and after["decision"]["verdict"] == "SCHEDULABLE")
 
 
 def main() -> int:

@@ -72,6 +72,17 @@
       冻结时间：<span id="v-frozen-at"></span>
     </p>
     <div id="verdict-body"></div>
+
+    <!-- 实例等待链复核：选择已出现的流实例，查看逐段等待归因 -->
+    <div id="waitchain-section" hidden>
+      <h3>实例等待链复核</h3>
+      <p class="meta">选择已出现的流实例，查看其从释放到开始发送（或超期）的逐段等待归因；
+        每段标明队列长度、门状态、可发送最高优先级与互斥阻塞类别。</p>
+      <label>流实例
+        <select id="waitchain-instance"></select>
+      </label>
+      <div id="waitchain-result"></div>
+    </div>
   </section>
 
   <section class="card" id="stale-note" hidden>

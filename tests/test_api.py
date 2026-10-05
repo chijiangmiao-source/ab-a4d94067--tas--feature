@@ -151,6 +151,99 @@ class ApiTests(unittest.TestCase):
             chain = body["decision"]["growth_chain"]
             self.assertGreaterEqual(len(chain), 2)
 
+    def test_wait_chain_endpoint(self):
+        miss = {
+            "audit_id": "API-WAIT",
+            "gate_period": 1000,
+            "flows": [
+                {"flow_id": "HI", "priority": 0, "period": 1000,
+                 "transmit_time": 600, "deadline": 1000},
+                {"flow_id": "LO", "priority": 1, "period": 2000,
+                 "transmit_time": 300, "deadline": 800},
+            ],
+            "gate_entries": [
+                {"start": 0, "end": 600, "priorities": [0]},
+                {"start": 600, "end": 1000, "priorities": [1]},
+            ],
+        }
+        with HttpServerFixture() as srv:
+            status, body = srv.call("POST", "/api/submit", miss)
+            self.assertEqual(status, 201)
+            self.assertEqual(body["decision"]["verdict"], "DEADLINE_MISS")
+            frozen_hash = body["content_hash"]
+            # 裁决主体带实例索引但不内嵌等待链大数据（保持读取兼容）。
+            self.assertIn("instances", body["decision"])
+            self.assertNotIn("wait_chains", body["decision"])
+
+            status, w = srv.call("GET", "/api/decisions/API-WAIT/waits/LO/0")
+            self.assertEqual(status, 200)
+            self.assertTrue(w["ok"])
+            self.assertEqual(w["content_hash"], frozen_hash)
+            self.assertEqual(w["frame"]["frame"], "LO#0")
+            self.assertTrue(w["frame"]["started"])
+            iv = w["wait"]["intervals"]
+            # LO#0 在 [0,600) 被 HI#0 占用，600 开始发送：单段、连续覆盖。
+            self.assertEqual([(s["from"], s["to"]) for s in iv], [(0, 600)])
+            self.assertEqual(w["wait"]["to"], 600)
+            self.assertEqual(iv[0]["blocker"], "higher_priority_tx")
+            self.assertEqual(iv[0]["source"]["frame"], "HI#0")
+            self.assertEqual(iv[0]["source"]["flow_id"], "HI")
+            self.assertEqual(iv[0]["source"]["release"], 0)
+            for s in iv:
+                self.assertIn("queue_length", s)
+                self.assertIn("gate_open", s)
+                self.assertIn("eligible_priority", s)
+
+            # 不存在的实例 -> 404 INSTANCE_NOT_FOUND。
+            status, w = srv.call("GET", "/api/decisions/API-WAIT/waits/LO/9")
+            self.assertEqual(status, 404)
+            self.assertEqual(w["error"], "INSTANCE_NOT_FOUND")
+            status, w = srv.call("GET", "/api/decisions/API-WAIT/waits/NOPE/0")
+            self.assertEqual(status, 404)
+            self.assertEqual(w["error"], "INSTANCE_NOT_FOUND")
+            # 不存在的裁决 -> 404 NOT_FOUND。
+            status, w = srv.call("GET", "/api/decisions/NOPE/waits/LO/0")
+            self.assertEqual(status, 404)
+            self.assertEqual(w["error"], "NOT_FOUND")
+            # 非法实例序号 -> 400。
+            status, w = srv.call("GET", "/api/decisions/API-WAIT/waits/LO/abc")
+            self.assertEqual(status, 400)
+            self.assertEqual(w["error"], "INVALID_INSTANCE")
+
+            # 查询不改写冻结结果。
+            status, again = srv.call("GET", "/api/decisions/API-WAIT")
+            self.assertEqual(status, 200)
+            self.assertEqual(again["content_hash"], frozen_hash)
+            self.assertEqual(again["decision"]["verdict"], "DEADLINE_MISS")
+
+    def test_wait_chain_unsent_frame_via_api(self):
+        # 门从不为 p1 开放：B#0 超期且未开始，证据精确覆盖至截止期。
+        payload = {
+            "audit_id": "API-WAIT-UNSENT",
+            "gate_period": 1000,
+            "flows": [
+                {"flow_id": "A", "priority": 0, "period": 1000,
+                 "transmit_time": 100, "deadline": 1000},
+                {"flow_id": "B", "priority": 1, "period": 1000,
+                 "transmit_time": 100, "deadline": 1000},
+            ],
+            "gate_entries": [{"start": 0, "end": 200, "priorities": [0]}],
+        }
+        with HttpServerFixture() as srv:
+            status, body = srv.call("POST", "/api/submit", payload)
+            self.assertEqual(status, 201)
+            self.assertEqual(body["decision"]["verdict"], "NON_CONVERGENT")
+            status, w = srv.call("GET", "/api/decisions/API-WAIT-UNSENT/waits/B/0")
+            self.assertEqual(status, 200)
+            self.assertEqual(w["wait"]["outcome"], "unsent")
+            self.assertEqual((w["wait"]["from"], w["wait"]["to"]), (0, 1000))
+            self.assertFalse(w["frame"]["started"])
+            self.assertTrue(w["frame"]["unsent_at_deadline"])
+            iv = w["wait"]["intervals"]
+            for a, b in zip(iv, iv[1:]):
+                self.assertEqual(a["to"], b["from"])
+            self.assertEqual(iv[-1]["to"], 1000)
+
 
 if __name__ == "__main__":
     unittest.main()

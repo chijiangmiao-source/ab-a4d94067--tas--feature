@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from .models import ValidationError, parse_request
+from .scheduler import build_wait_chain
 from .store import ConflictError, DecisionStore
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -61,7 +62,13 @@ def make_handler(store: DecisionStore) -> type[BaseHTTPRequestHandler]:
             elif path == "/api/health":
                 self._json({"ok": True, "frozen_ids": store.list_ids()})
             elif path.startswith("/api/decisions/"):
-                audit_id = unquote(path[len("/api/decisions/"):])
+                rest = unquote(path[len("/api/decisions/"):])
+                parts = rest.split("/")
+                if len(parts) == 4 and parts[1] == "waits":
+                    # /api/decisions/<audit_id>/waits/<flow_id>/<seq>
+                    self._serve_wait_chain(parts[0], parts[2], parts[3])
+                    return
+                audit_id = rest
                 decision = store.get(audit_id)
                 if decision is None:
                     self._error(404, "NOT_FOUND", f"审计标识 {audit_id} 尚无冻结裁决")
@@ -111,6 +118,35 @@ def make_handler(store: DecisionStore) -> type[BaseHTTPRequestHandler]:
             self._json(
                 {"ok": True, "created": created, **decision.to_json()},
                 201 if created else 200,
+            )
+
+        # ---- 静态资源 ----
+
+        def _serve_wait_chain(self, audit_id: str, flow_id: str, seq_raw: str) -> None:
+            """按实例查询已冻结裁决的逐段等待链（只读，绝不改写冻结结果）。"""
+            decision = store.get(audit_id)
+            if decision is None:
+                self._error(404, "NOT_FOUND", f"审计标识 {audit_id} 尚无冻结裁决")
+                return
+            try:
+                seq = int(seq_raw)
+                if seq < 0:
+                    raise ValueError
+            except ValueError:
+                self._error(400, "INVALID_INSTANCE", "实例序号必须是非负整数")
+                return
+            payload, err = build_wait_chain(decision.waits, flow_id, seq)
+            if err is not None:
+                status, code, message = err
+                self._error(status, code, message)
+                return
+            self._json(
+                {
+                    "ok": True,
+                    "audit_id": audit_id,
+                    "content_hash": decision.content_hash,
+                    **payload,
+                }
             )
 
         # ---- 静态资源 ----

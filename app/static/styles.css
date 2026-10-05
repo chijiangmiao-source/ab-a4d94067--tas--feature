@@ -91,3 +91,23 @@ input:focus { outline: none; border-color: #38bdf8; }
   margin: 6px 0; border-radius: 4px; font-size: 13px; font-family: ui-monospace, monospace; }
 .paginator { margin-top: 8px; display: flex; gap: 10px; align-items: center; }
 .paginator select, .paginator button { font-size: 12px; }
+
+/* 实例等待链 */
+#waitchain-section { margin-top: 14px; border-top: 1px dashed #334155; padding-top: 10px; }
+#waitchain-section h3 { margin-top: 0; }
+#waitchain-instance {
+  background: #0f172a; border: 1px solid #475569; border-radius: 6px;
+  padding: 8px 10px; color: #e2e8f0; font-size: 13px; margin-top: 4px;
+  max-width: 100%;
+}
+#waitchain-result { margin-top: 10px; }
+#waitchain-result table { width: 100%; border-collapse: collapse; font-size: 12px; margin: 8px 0; }
+#waitchain-result th, #waitchain-result td { border: 1px solid #334155; padding: 4px 6px; text-align: left; }
+#waitchain-result th { background: #0f172a; color: #94a3b8; }
+.blk { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; white-space: nowrap; }
+.blk-higher_priority_tx { background: #7c2d12; color: #ffedd5; }
+.blk-nonpreemptive_hold { background: #78350f; color: #fef3c7; }
+.blk-same_flow_fifo { background: #4c1d95; color: #ede9fe; }
+.blk-gate_closed { background: #1e3a8a; color: #dbeafe; }
+.blk-window_too_short { background: #155e75; color: #cffafe; }
+.blk-unknown { background: #334155; color: #e2e8f0; }

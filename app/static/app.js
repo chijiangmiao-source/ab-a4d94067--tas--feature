@@ -129,11 +129,18 @@ function showError(msg) {
 function clearError() { $("#form-error").hidden = true; }
 
 function invalidateVerdict() {
-  // 修改输入即清除旧裁决，避免页面残留过期结论。
+  // 修改输入即清除旧裁决与等待链，避免页面残留过期结论。
   verdictCard.hidden = true;
   timelineCard.hidden = true;
   staleNote.hidden = false;
+  clearWaitChain();
   clearError();
+}
+
+function clearWaitChain() {
+  $("#waitchain-section").hidden = true;
+  $("#waitchain-instance").innerHTML = "";
+  $("#waitchain-result").innerHTML = "";
 }
 
 async function submitSchedule() {
@@ -209,7 +216,100 @@ function renderDecision(data, readonlyExisting) {
   else if (d.verdict === "DEADLINE_MISS") body.innerHTML = renderMiss(d);
   else body.innerHTML = renderGrowth(d);
 
+  setupWaitChain(data);
   renderTimeline(d.timeline, d.verdict);
+}
+
+/* ---------------- 实例等待链 ---------------- */
+
+const BLOCKER_LABELS = {
+  higher_priority_tx: "更高优先级帧占用出口",
+  nonpreemptive_hold: "非抢占占用（同/低优先级帧发送中）",
+  same_flow_fifo: "同流前序帧未发完（FIFO）",
+  gate_closed: "门关闭，等待下一窗口",
+  window_too_short: "窗口剩余不足，不启动",
+  unknown: "未分类"
+};
+
+function setupWaitChain(data) {
+  const section = $("#waitchain-section");
+  const select = $("#waitchain-instance");
+  $("#waitchain-result").innerHTML = "";
+  const instances = (data.decision && data.decision.instances) || [];
+  if (!instances.length) { section.hidden = true; return; }
+  section.hidden = false;
+  select.innerHTML = `<option value="">— 选择实例 —</option>` + instances.map((f) => {
+    const state = f.start !== null
+      ? `开始 ${f.start}μs`
+      : (f.state === "late" ? "超期未发送" : "未开始");
+    return `<option value="${f.flow_id}|${f.seq}">` +
+      `${f.frame} · 释放 ${f.release}μs · 截止 ${f.deadline}μs · ${state}</option>`;
+  }).join("");
+  select.dataset.auditId = data.audit_id;
+}
+
+async function loadWaitChain(ev) {
+  const select = ev.target;
+  const result = $("#waitchain-result");
+  const v = select.value;
+  if (!v) { result.innerHTML = ""; return; }
+  const [flowId, seq] = v.split("|");
+  const auditId = select.dataset.auditId;
+  result.innerHTML = `<p class="meta">查询等待链…</p>`;
+  let resp;
+  try {
+    resp = await fetch(
+      `/api/decisions/${encodeURIComponent(auditId)}/waits/` +
+      `${encodeURIComponent(flowId)}/${encodeURIComponent(seq)}`);
+  } catch (err) {
+    result.innerHTML = `<p class="form-error">查询失败（网络错误）：${err.message}</p>`;
+    return;
+  }
+  const data = await resp.json();
+  if (!resp.ok) {
+    result.innerHTML = `<p class="form-error">查询失败（${resp.status}）：${data.message}</p>`;
+    return;
+  }
+  result.innerHTML = renderWaitChain(data);
+}
+
+function renderWaitChain(data) {
+  const f = data.frame;
+  const w = data.wait;
+  const outcomeText = {
+    started: "已开始发送",
+    unsent: "超期且未发送",
+    pending: "模拟结束时仍在等待"
+  }[w.outcome] || w.outcome;
+  let html = `<h4>实例 ${f.frame} 等待链</h4>
+    <table><tbody>
+      <tr><th>释放</th><td>${fmtTime(f.release)}</td>
+          <th>截止期</th><td>${fmtTime(f.deadline)}</td></tr>
+      <tr><th>开始发送</th><td>${fmtTime(f.start)}</td>
+          <th>发送完成</th><td>${fmtTime(f.finish)}</td></tr>
+      <tr><th>等待区间</th><td>[${w.from}, ${w.to}) μs，共 ${w.total} μs</td>
+          <th>结论</th><td>${outcomeText}${f.unsent_at_deadline ? "（截止期时未发送）" : ""}</td></tr>
+    </tbody></table>`;
+  if (!w.intervals.length) {
+    return html + `<p class="meta">释放后即开始发送，无等待。</p>`;
+  }
+  html += `<table><thead><tr>
+      <th>区间 [起, 止) μs</th><th>时长</th><th>阻塞类别</th><th>队列长度</th>
+      <th>门开放</th><th>可发送最高优先级</th><th>关联帧（流 / 释放时刻）</th>
+    </tr></thead><tbody>`;
+  for (const s of w.intervals) {
+    const src = s.source
+      ? `${s.source.frame}（流 ${s.source.flow_id}，释放 ${s.source.release}μs）`
+      : "—";
+    html += `<tr>
+      <td>[${s.from}, ${s.to})</td><td>${s.to - s.from} μs</td>
+      <td><span class="blk blk-${s.blocker}">${BLOCKER_LABELS[s.blocker] || s.blocker}</span></td>
+      <td>${s.queue_length}</td>
+      <td>${s.gate_open.length ? "P" + s.gate_open.join(", P") : "全关"}</td>
+      <td>${s.eligible_priority === null ? "—" : "P" + s.eligible_priority}</td>
+      <td>${src}</td></tr>`;
+  }
+  return html + `</tbody></table>`;
 }
 
 function evidenceTable(rows) {
@@ -338,6 +438,7 @@ $("#example-miss").addEventListener("click", () => loadForm(EXAMPLES.miss));
 $("#example-growth").addEventListener("click", () => loadForm(EXAMPLES.growth));
 $("#audit-id").addEventListener("input", invalidateVerdict);
 $("#gate-period").addEventListener("input", invalidateVerdict);
+$("#waitchain-instance").addEventListener("change", loadWaitChain);
 
 /* 初始表单 */
 flowsBody.appendChild(flowRow({ flow_id: "CTRL", priority: 0, period: 1000, transmit_time: 100, deadline: 1000 }));

@@ -3,7 +3,7 @@
 import unittest
 
 from app.models import ValidationError, parse_request
-from app.scheduler import adjudicate
+from app.scheduler import adjudicate, build_wait_chain
 
 
 def make(audit_id="T", gate_period=1000, flows=None, gates=None):
@@ -263,6 +263,161 @@ class NonConvergentTests(unittest.TestCase):
         for seg in v["timeline"]:
             if seg["transmitting"] is not None:
                 self.assertNotEqual(seg["transmitting"]["flow_id"], "B")
+
+
+class WaitChainTests(unittest.TestCase):
+    """逐段等待链：模拟时记录的阻塞归因（类别互斥、区间连续无重叠）。"""
+
+    def test_carryover_lo0_higher_priority_then_gate_closed(self):
+        v = adjudicate(make(**CARRYOVER))
+        waits = v["wait_chains"]
+        self.assertTrue(waits["available"])
+        payload, err = build_wait_chain(waits, "LO", 0)
+        self.assertIsNone(err)
+        w = payload["wait"]
+        # LO#0 被 HI#0 占用 [0,400)，随后门全关等到 1000 才开始发送。
+        self.assertEqual((w["from"], w["to"], w["total"]), (0, 1000, 1000))
+        self.assertEqual(w["outcome"], "started")
+        iv = w["intervals"]
+        self.assertEqual([(s["from"], s["to"]) for s in iv], [(0, 400), (400, 1000)])
+        self.assertEqual(iv[0]["blocker"], "higher_priority_tx")
+        self.assertEqual(
+            iv[0]["source"],
+            {"frame": "HI#0", "flow_id": "HI", "release": 0},
+        )
+        self.assertEqual(iv[0]["queue_length"], 1)
+        self.assertEqual(iv[0]["gate_open"], [0, 1])
+        self.assertEqual(iv[0]["eligible_priority"], 1)
+        self.assertEqual(iv[1]["blocker"], "gate_closed")
+        self.assertIsNone(iv[1]["source"])
+        self.assertEqual(iv[1]["gate_open"], [])
+        self.assertIsNone(iv[1]["eligible_priority"])
+
+    def test_window_too_short_not_merged_with_other_causes(self):
+        # 同一帧的等待依次由 窗口不足 -> 高优先级占用 造成，两类必须分段。
+        v = adjudicate(
+            make(
+                gate_period=1000,
+                flows=[
+                    {"flow_id": "HI", "priority": 0, "period": 2000,
+                     "transmit_time": 500, "deadline": 2000},
+                    {"flow_id": "LO", "priority": 1, "period": 2000,
+                     "transmit_time": 300, "deadline": 800},
+                ],
+                gates=[
+                    {"start": 0, "end": 100, "priorities": [1]},
+                    {"start": 100, "end": 600, "priorities": [0]},
+                    {"start": 600, "end": 1000, "priorities": [1]},
+                ],
+            )
+        )
+        payload, err = build_wait_chain(v["wait_chains"], "LO", 0)
+        self.assertIsNone(err)
+        kinds = [(s["from"], s["to"], s["blocker"]) for s in payload["wait"]["intervals"]]
+        self.assertEqual(
+            kinds,
+            [(0, 100, "window_too_short"), (100, 600, "higher_priority_tx")],
+        )
+
+    def test_same_flow_fifo_records_source_frame(self):
+        # LO#1 释放时同流 LO#0 正在发送：阻塞类别为同流 FIFO，关联帧 LO#0。
+        # （前序帧被高优先级推迟后发送越过截止期，故整体裁决为 DEADLINE_MISS；
+        # 同流 FIFO 等待本身独立于裁决类型记录。）
+        v = adjudicate(
+            make(
+                gate_period=1000,
+                flows=[
+                    {"flow_id": "HI", "priority": 0, "period": 2000,
+                     "transmit_time": 400, "deadline": 2000},
+                    {"flow_id": "LO", "priority": 1, "period": 500,
+                     "transmit_time": 300, "deadline": 500},
+                ],
+                gates=[
+                    {"start": 0, "end": 400, "priorities": [0]},
+                    {"start": 400, "end": 1000, "priorities": [0, 1]},
+                ],
+            )
+        )
+        self.assertEqual(v["verdict"], "DEADLINE_MISS")
+        payload, err = build_wait_chain(v["wait_chains"], "LO", 1)
+        self.assertIsNone(err)
+        iv = payload["wait"]["intervals"]
+        self.assertEqual([(s["from"], s["to"]) for s in iv], [(500, 700)])
+        self.assertEqual(iv[0]["blocker"], "same_flow_fifo")
+        self.assertEqual(iv[0]["source"]["frame"], "LO#0")
+        self.assertEqual(iv[0]["source"]["flow_id"], "LO")
+        self.assertEqual(iv[0]["source"]["release"], 0)
+
+    def test_unsent_frame_covers_exactly_to_deadline(self):
+        # 门从不为 p1 开放：B#0 到截止期仍未开始，证据精确覆盖至截止期。
+        v = adjudicate(
+            make(
+                gate_period=1000,
+                flows=[
+                    {"flow_id": "A", "priority": 0, "period": 1000,
+                     "transmit_time": 100, "deadline": 1000},
+                    {"flow_id": "B", "priority": 1, "period": 1000,
+                     "transmit_time": 100, "deadline": 1000},
+                ],
+                gates=[{"start": 0, "end": 200, "priorities": [0]}],
+            )
+        )
+        self.assertEqual(v["verdict"], "NON_CONVERGENT")
+        payload, err = build_wait_chain(v["wait_chains"], "B", 0)
+        self.assertIsNone(err)
+        w = payload["wait"]
+        self.assertEqual((w["from"], w["to"]), (0, 1000))
+        self.assertEqual(w["outcome"], "unsent")
+        self.assertFalse(payload["frame"]["started"])
+        self.assertTrue(payload["frame"]["unsent_at_deadline"])
+        iv = w["intervals"]
+        self.assertEqual(iv[0]["blocker"], "higher_priority_tx")  # [0,200) A#0 占用
+        self.assertIn("gate_closed", [s["blocker"] for s in iv])
+        self.assertEqual(iv[-1]["to"], 1000)
+
+    def test_missing_instance_returns_error(self):
+        v = adjudicate(make(**CARRYOVER))
+        payload, err = build_wait_chain(v["wait_chains"], "LO", 99)
+        self.assertIsNone(payload)
+        self.assertEqual(err[0], 404)
+        self.assertEqual(err[1], "INSTANCE_NOT_FOUND")
+        payload, err = build_wait_chain(v["wait_chains"], "NOPE", 0)
+        self.assertIsNone(payload)
+        self.assertEqual(err[0], 404)
+
+    def test_intervals_contiguous_for_every_instance(self):
+        # 任意实例：区间连续无重叠，且精确覆盖 [release, start/deadline/末端]。
+        v = adjudicate(make(**CARRYOVER))
+        waits = v["wait_chains"]
+        for meta in waits["frames"].values():
+            payload, err = build_wait_chain(waits, meta["flow_id"], meta["seq"])
+            self.assertIsNone(err, meta)
+            w = payload["wait"]
+            iv = w["intervals"]
+            if not iv:
+                self.assertEqual(w["total"], 0)
+                continue
+            self.assertEqual(iv[0]["from"], w["from"])
+            self.assertEqual(iv[-1]["to"], w["to"])
+            for a, b in zip(iv, iv[1:]):
+                self.assertLess(a["from"], a["to"])
+                self.assertEqual(a["to"], b["from"])
+            self.assertEqual(
+                sum(s["to"] - s["from"] for s in iv), w["total"]
+            )
+
+    def test_instances_index_in_verdict(self):
+        v = adjudicate(make(**CARRYOVER))
+        self.assertIn("instances", v)
+        fids = {f["frame"] for f in v["instances"]}
+        self.assertIn("LO#0", fids)
+        self.assertIn("HI#0", fids)
+        self.assertEqual(v["instances_total"], len(v["instances"]))
+        lo0 = next(f for f in v["instances"] if f["frame"] == "LO#0")
+        self.assertEqual(
+            {k: lo0[k] for k in ("release", "deadline", "start", "finish")},
+            {"release": 0, "deadline": 2000, "start": 1000, "finish": 1400},
+        )
 
 
 class TimelineTests(unittest.TestCase):

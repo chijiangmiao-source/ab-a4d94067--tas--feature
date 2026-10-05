@@ -33,6 +33,9 @@ class FrozenDecision:
     frozen_at: float
     request: dict[str, Any]
     verdict: dict[str, Any]
+    # 逐段等待链证据（模拟时记录，随裁决冻结；经专用接口按实例查询，
+    # 不内嵌在裁决主体中以保持读取响应兼容）。
+    waits: dict[str, Any]
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -62,12 +65,17 @@ class DecisionStore:
                     )
                 return existing, False
             verdict = adjudicate(req)
+            # 等待链证据从裁决主体移出，随冻结一并保存；裁决主体保持兼容。
+            waits = verdict.pop(
+                "wait_chains", {"available": False, "frames": {}}
+            )
             decision = FrozenDecision(
                 audit_id=req.audit_id,
                 content_hash=content_hash,
                 frozen_at=time.time(),
                 request=req.to_json(),
                 verdict=verdict,
+                waits=waits,
             )
             self._decisions[req.audit_id] = decision
             return decision, True
