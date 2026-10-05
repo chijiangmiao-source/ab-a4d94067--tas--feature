@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>机载以太网 TAS 门控调度审计裁决</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>机载以太网发布门控调度 · 冻结裁决</h1>
+  <span id="health" class="health">连接中…</span>
+</header>
+
+<main class="layout">
+  <!-- ================= 录入区 ================= -->
+  <section class="card" id="input-card">
+    <h2>调度输入</h2>
+
+    <div class="grid-two">
+      <label>稳定审计标识
+        <input id="audit-id" type="text" placeholder="如 A350-TAS-2026-001" autocomplete="off">
+      </label>
+      <label>门控周期（整数微秒）
+        <input id="gate-period" type="number" min="1" step="1" value="1000">
+      </label>
+    </div>
+
+    <h3>流（至多 8 条；优先级数值越小越高）</h3>
+    <table class="flows-table">
+      <thead>
+        <tr>
+          <th>流标识</th><th>优先级(0-7)</th><th>周期 μs</th>
+          <th>发送时长 μs</th><th>截止期 μs</th><th></th>
+        </tr>
+      </thead>
+      <tbody id="flows-body"></tbody>
+    </table>
+    <button type="button" id="add-flow" class="btn-secondary">＋ 添加流</button>
+
+    <h3>门控项（按时间升序；只放行列明优先级）</h3>
+    <table class="gates-table">
+      <thead>
+        <tr>
+          <th>开始 μs</th><th>结束 μs</th><th>开放优先级（勾选）</th><th></th>
+        </tr>
+      </thead>
+      <tbody id="gates-body"></tbody>
+    </table>
+    <button type="button" id="add-gate" class="btn-secondary">＋ 添加门控项</button>
+
+    <div class="actions">
+      <button type="button" id="submit-btn" class="btn-primary">提交并读取冻结裁决</button>
+      <button type="button" id="load-btn" class="btn-secondary" title="按当前审计标识读取已冻结裁决">读取冻结裁决</button>
+      <button type="button" id="example-schedulable" class="btn-link">可调度示例</button>
+      <button type="button" id="example-miss" class="btn-link">超期示例</button>
+      <button type="button" id="example-growth" class="btn-link">队列增长示例</button>
+    </div>
+    <div id="form-error" class="form-error" hidden></div>
+  </section>
+
+  <!-- ================= 裁决区 ================= -->
+  <section class="card verdict-card" id="verdict-card" hidden>
+    <div class="verdict-head">
+      <h2>冻结裁决</h2>
+      <span id="verdict-badge" class="badge">—</span>
+    </div>
+    <p id="verdict-summary" class="summary"></p>
+    <p class="meta">
+      审计标识：<code id="v-audit"></code> ·
+      内容哈希：<code id="v-hash"></code> ·
+      冻结时间：<span id="v-frozen-at"></span>
+    </p>
+    <div id="verdict-body"></div>
+  </section>
+
+  <section class="card" id="stale-note" hidden>
+    <p class="stale">⚠ 输入已修改或提交失败，上方旧裁决已清除。重新提交后读取新的冻结结论。</p>
+  </section>
+
+  <!-- ================= 逐时隙时间线 ================= -->
+  <section class="card timeline-card" id="timeline-card" hidden>
+    <h2>逐时隙队列 / 门状态 / 发送结果</h2>
+    <div class="timeline-scroll">
+      <table class="timeline-table">
+        <thead>
+          <tr>
+            <th>时隙 [起, 止) μs</th>
+            <th>门开放优先级</th>
+            <th>各优先级队列（队首→队尾）</th>
+            <th>发送结果</th>
+          </tr>
+        </thead>
+        <tbody id="timeline-body"></tbody>
+      </table>
+    </div>
+    <p id="timeline-note" class="meta"></p>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

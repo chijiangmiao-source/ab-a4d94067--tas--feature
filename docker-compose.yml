@@ -1,0 +1,26 @@
+services:
+  web:
+    build: .
+    image: tas-audit:latest
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+        "import json,urllib.request,sys; sys.exit(0 if json.load(urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=3)).get('ok') else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
+
+  # 一次性验收服务：构建检查 -> 单元测试 -> HTTP 冒烟，执行后以退出码退出。
+  verify:
+    build: .
+    image: tas-audit:latest
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      SMOKE_BASE_URL: http://web:8080
+    entrypoint: ["/bin/sh", "scripts/verify.sh"]
+    restart: "no"
