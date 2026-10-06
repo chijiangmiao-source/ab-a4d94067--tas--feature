@@ -13,8 +13,11 @@
    校验 SCHEDULABLE、逐时隙证据与遗留边界样本（t=1000 时遗留 1 帧、超周期排空）；
 3. 幂等冻结：相同内容重复提交/读取返回同一 content_hash；
 4. 冲突：同一审计标识不同内容 -> 409 且原裁决不变；
-5. 队列增长拒绝：提交不可收敛场景，校验 NON_CONVERGENT 与连续增长链；
-6. 输入校验失败返回 400。
+- 5. 队列增长拒绝：提交不可收敛场景，校验 NON_CONVERGENT 与连续增长链；
+6. 输入校验失败返回 400；
+7. 实例等待链：选择已出现实例经真实接口取回连续无重叠等待区间，
+   校验逐段队列长度/门状态/可发送最高优先级/阻塞类别与关联帧，
+   以及不存在实例 404、不可追溯实例 422 且冻结结果不变。
 任一断言失败以非零退出码退出。
 """
 
@@ -179,6 +182,62 @@ def run_smoke(base: str) -> None:
           and isinstance(body7, dict) and body7.get("error") == "VALIDATION_FAILED")
     status, body8 = request("GET", base + "/api/decisions/NO-SUCH-ID")
     check("读取不存在裁决 -> 404", status == 404)
+
+    print("[7] 实例等待链（真实接口，连续、无重叠、分类不合并）")
+    # 裁决体内含实例目录。
+    catalog = body6.get("decision", {}).get("instances", {})
+    fids = [i["frame"] for i in catalog.get("instances", [])]
+    check("NON_CONVERGENT 裁决列出已出现实例", "FLOOD#0" in fids and "FLOOD#1" in fids, str(fids))
+
+    # CARRYOVER 的 LO#0：[0,400) 高优先级先占 + [400,1000) 门关闭，两类不得合并。
+    status, wc = request("GET", base + "/api/decisions/SMK-CARRY-001/wait-chain?frame=LO%230")
+    check("等待链接口 -> 200", status == 200 and isinstance(wc, dict), str(wc))
+    ivs = wc.get("wait_chain", {}).get("intervals", []) if isinstance(wc, dict) else []
+    contig = bool(ivs) and ivs[0]["from"] == 0 and all(
+        a["to"] == b["from"] for a, b in zip(ivs, ivs[1:]))
+    check("等待区间按时间连续、首尾相接", contig)
+    check("覆盖至开始发送时刻 1000μs", ivs and ivs[-1]["to"] == 1000, str([(i["from"], i["to"]) for i in ivs]))
+    check("区间时长之和等于总等待",
+          sum(i["duration_us"] for i in ivs) == wc["wait_chain"]["total_wait_us"] == 1000)
+    kinds = [i["blocking_category"] for i in ivs]
+    check("高优先级先占与门关闭未合并成同一原因",
+          kinds == ["higher_priority_tx", "gate_closed"], str(kinds))
+    hp = next(i for i in ivs if i["blocking_category"] == "higher_priority_tx")
+    check("先占段关联帧流与释放时刻",
+          hp["source_frame"] == "HI#0" and hp["source_flow"] == "HI"
+          and hp["source_release"] == 0, str(hp))
+    fields_ok = all(
+        {"queue_length", "gate_state", "top_ready_priority", "blocking_category"} <= set(i)
+        for i in ivs)
+    check("每段含队列长度/门状态/可发送最高优先级/阻塞类别", fields_ok)
+
+    # 增长场景 FLOOD#1：全程被同流 FIFO 前序帧阻塞，证据覆盖至其截止期且未发送。
+    status, wf = request("GET", base + "/api/decisions/SMK-GROWTH-001/wait-chain?frame=FLOOD%231")
+    fivs = wf.get("wait_chain", {}).get("intervals", []) if isinstance(wf, dict) else []
+    check("FLOOD#1 等待链 -> 200", status == 200 and bool(fivs))
+    check("FLOOD#1 全程同流 FIFO 阻塞且关联 FLOOD#0/释放0",
+          fivs and all(i["blocking_category"] == "same_flow_fifo"
+                       and i["source_frame"] == "FLOOD#0" and i["source_release"] == 0
+                       for i in fivs),
+          str([(i["blocking_category"], i["source_frame"]) for i in fivs]))
+    wfr = wf.get("wait_chain", {}) if isinstance(wf, dict) else {}
+    check("FLOOD#1 证据覆盖至截止期 2000μs 且标明未发送",
+          wfr.get("coverage") == [1000, 2000] and wfr.get("frame", {}).get("unsent") is True,
+          str(wfr.get("coverage")))
+
+    # 不存在的实例 -> 404 INSTANCE_NOT_FOUND。
+    status, we1 = request("GET", base + "/api/decisions/SMK-CARRY-001/wait-chain?frame=NOPE%239")
+    check("不存在实例 -> 404 INSTANCE_NOT_FOUND",
+          status == 404 and isinstance(we1, dict) and we1.get("error") == "INSTANCE_NOT_FOUND", str(we1))
+    # 证据末端刚释放、不可连续追溯的实例 -> 422 UNTRACEABLE。
+    status, we2 = request("GET", base + "/api/decisions/SMK-GROWTH-001/wait-chain?frame=FLOOD%232")
+    check("不可追溯实例 -> 422 UNTRACEABLE",
+          status == 422 and isinstance(we2, dict) and we2.get("error") == "UNTRACEABLE", str(we2))
+    # 错误查询不改写冻结结果。
+    status, after = request("GET", base + "/api/decisions/SMK-GROWTH-001")
+    check("异常查询后冻结裁决不变",
+          after.get("content_hash") == body6["content_hash"]
+          and after["decision"]["verdict"] == "NON_CONVERGENT")
 
 
 def main() -> int:

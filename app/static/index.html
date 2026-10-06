@@ -72,6 +72,20 @@
       冻结时间：<span id="v-frozen-at"></span>
     </p>
     <div id="verdict-body"></div>
+
+    <!-- ================= 实例等待链复核 ================= -->
+    <div id="waitchain-panel" class="waitchain-panel">
+      <h3>流实例等待链复核（真实接口，按连续时隙归因）</h3>
+      <div class="paginator">
+        <label>选择已出现的流实例
+          <select id="instance-select"></select>
+        </label>
+        <button type="button" id="waitchain-btn" class="btn-secondary">读取等待链</button>
+        <span id="waitchain-status" class="meta"></span>
+      </div>
+      <div id="waitchain-error" class="form-error" hidden></div>
+      <div id="waitchain-body"></div>
+    </div>
   </section>
 
   <section class="card" id="stale-note" hidden>

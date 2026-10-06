@@ -7,7 +7,23 @@ const gatesBody = $("#gates-body");
 const verdictCard = $("#verdict-card");
 const staleNote = $("#stale-note");
 const timelineCard = $("#timeline-card");
+const waitPanel = $("#waitchain-panel");
+const instanceSelect = $("#instance-select");
+const waitBody = $("#waitchain-body");
+const waitError = $("#waitchain-error");
+const waitStatus = $("#waitchain-status");
 const MAX_TIMELINE_ROWS = 400;
+
+let currentAuditId = null;
+let currentInstances = [];
+
+const CATEGORY_LABELS = {
+  gate_closed: "门关闭 · 等待下一窗口",
+  window_too_short: "窗口剩余不足 · 不启动",
+  higher_priority_tx: "更高优先级帧先占出口（非抢占）",
+  nonpreemptive_hold: "非抢占占用（含跨周期遗留）",
+  same_flow_fifo: "同流 FIFO · 前序实例未完成"
+};
 
 /* ---------------- 示例输入 ---------------- */
 
@@ -132,6 +148,14 @@ function invalidateVerdict() {
   // 修改输入即清除旧裁决，避免页面残留过期结论。
   verdictCard.hidden = true;
   timelineCard.hidden = true;
+  waitPanel.hidden = true;
+  instanceSelect.replaceChildren();
+  waitBody.replaceChildren();
+  waitError.hidden = true;
+  waitError.textContent = "";
+  waitStatus.textContent = "";
+  currentAuditId = null;
+  currentInstances = [];
   staleNote.hidden = false;
   clearError();
 }
@@ -210,6 +234,140 @@ function renderDecision(data, readonlyExisting) {
   else body.innerHTML = renderGrowth(d);
 
   renderTimeline(d.timeline, d.verdict);
+  setupInstancePicker(data.audit_id, d);
+}
+
+/* ---------------- 实例选择与等待链 ---------------- */
+
+function instanceLabel(it) {
+  const state = it.unsent ? "未发送" :
+    (it.transmit_end !== null && it.transmit_end !== undefined ? `发于${it.transmit_start}μs` : "发送中");
+  return `${it.frame}（P${it.priority}，释放 ${it.release}μs，截止 ${it.deadline}μs，${state}）`;
+}
+
+function setupInstancePicker(auditId, d) {
+  currentAuditId = auditId;
+  currentInstances = (d.instances && d.instances.instances) || [];
+  waitPanel.hidden = false;
+  waitBody.replaceChildren();
+  waitError.hidden = true;
+  waitStatus.textContent = "";
+  instanceSelect.replaceChildren();
+
+  if (!currentInstances.length) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "（裁决中无可追溯实例）";
+    instanceSelect.appendChild(opt);
+    instanceSelect.disabled = true;
+    $("#waitchain-btn").disabled = true;
+    return;
+  }
+  instanceSelect.disabled = false;
+  $("#waitchain-btn").disabled = false;
+
+  // 默认选中首个超期且未开始发送的帧，便于直接复核关键证据。
+  let preferred = null;
+  if (d.verdict === "DEADLINE_MISS") preferred = d.first_overdue_frame.frame;
+  currentInstances.forEach((it, idx) => {
+    const opt = document.createElement("option");
+    opt.value = it.frame;
+    opt.textContent = instanceLabel(it) + (it.queryable ? "" : " · 证据窗口外");
+    if (!it.queryable) { opt.disabled = true; }
+    instanceSelect.appendChild(opt);
+    if (it.frame === preferred) instanceSelect.value = it.frame;
+  });
+  if (preferred) instanceSelect.value = preferred;
+
+  // DEADLINE_MISS 已内嵌首个超期帧等待链，直接展示；其余等用户选择。
+  if (d.verdict === "DEADLINE_MISS" && d.first_overdue_frame.wait_chain) {
+    renderWaitChain(d.first_overdue_frame.wait_chain, true);
+  } else {
+    waitStatus.textContent = "请选择实例后读取其连续等待区间。";
+  }
+}
+
+async function loadWaitChain() {
+  waitError.hidden = true;
+  waitStatus.textContent = "读取中…";
+  const frame = instanceSelect.value;
+  if (!currentAuditId || !frame) {
+    showWaitError("请先选择一个已出现的流实例。");
+    return;
+  }
+  const url = `/api/decisions/${encodeURIComponent(currentAuditId)}/wait-chain?frame=${encodeURIComponent(frame)}`;
+  let resp;
+  try {
+    resp = await fetch(url);
+  } catch (err) {
+    showWaitError("等待链读取失败（网络错误）：" + err.message);
+    return;
+  }
+  const data = await resp.json();
+  if (!resp.ok) {
+    // 实例不存在 / 不可追溯：明确报错，不清空也不改写冻结裁决。
+    showWaitError(`等待链不可用（${resp.status} ${data.error}）：${data.message}`);
+    return;
+  }
+  waitStatus.textContent = "";
+  renderWaitChain(data.wait_chain, false);
+}
+
+function showWaitError(msg) {
+  waitStatus.textContent = "";
+  waitBody.replaceChildren();
+  waitError.hidden = false;
+  waitError.textContent = msg;
+}
+
+function renderWaitChain(ch, embedded) {
+  waitError.hidden = true;
+  const fr = ch.frame;
+  const cov = ch.coverage;
+  let html = `<div class="wc-head">
+    <h4>实例 ${fr.frame}（流 ${fr.flow_id}，P${fr.priority}，序号 ${fr.seq}）</h4>
+    <p class="meta">
+      证据覆盖 [${cov[0]}, ${cov[1]}) μs · 总等待 ${ch.total_wait_us} μs ·
+      释放 ${fr.release} / 入队 ${fr.enqueue} / 开始 ${fmtTime(fr.transmit_start)} /
+      完成 ${fmtTime(fr.transmit_end)} / 截止 ${fr.deadline} μs ·
+      ${fr.unsent ? '<b class="tx-late">截止期前未发送</b>' : "已开始发送"}
+      ${embedded ? "（内嵌于冻结裁决）" : "（实时接口读取，冻结结果不变）"}
+    </p>
+    <p class="meta">${ch.coverage_note}</p></div>`;
+
+  if (!ch.intervals.length) {
+    html += `<p class="meta">该实例释放即开始发送，等待区间为空。</p>`;
+  } else {
+    html += `<h4>按时间连续、无重叠的等待区间</h4>
+      <table class="wc-table"><thead><tr>
+        <th>#</th><th>区间 [起,止) μs</th><th>时长</th><th>队列长度</th>
+        <th>队内位置</th><th>本优先级门</th><th>可发送最高优先级</th>
+        <th>阻塞类别</th><th>关联帧（流 / 释放时刻）</th><th>归因说明</th>
+      </tr></thead><tbody>`;
+    for (const iv of ch.intervals) {
+      const top = iv.top_ready_priority === null ? "无（无帧可启动）" : `P${iv.top_ready_priority}`;
+      const gate = iv.gate_state === "open"
+        ? '<span class="tx-ok">开放</span>' : '<span class="tx-late">关闭</span>';
+      const src = iv.source_frame
+        ? `${iv.source_frame}（${iv.source_flow} / 释放 ${iv.source_release}μs）` : "—";
+      html += `<tr>
+        <td>${iv.index}</td>
+        <td class="queue-cell">[${iv.from}, ${iv.to})</td>
+        <td>${iv.duration_us}</td>
+        <td>${iv.queue_length}</td>
+        <td>${iv.queue_position ?? "—"}</td>
+        <td>${gate}</td>
+        <td>${top}</td>
+        <td><span class="cat-badge cat-${iv.blocking_category}">${CATEGORY_LABELS[iv.blocking_category] || iv.blocking_category}</span></td>
+        <td class="queue-cell">${src}</td>
+        <td>${iv.detail}</td></tr>`;
+    }
+    html += `</tbody></table>`;
+    html += `<p class="meta">区间首尾相接、无重叠；各类等待合计：` +
+      Object.entries(ch.duration_by_category)
+        .map(([k, v]) => `${CATEGORY_LABELS[k] || k} ${v}μs`).join("，") + `。</p>`;
+  }
+  waitBody.innerHTML = html;
 }
 
 function evidenceTable(rows) {
@@ -252,7 +410,7 @@ function renderMiss(d) {
       <tr><th>截止期</th><td>${fmtTime(f.deadline)}（超期时状态：${f.state_when_overdue}）</td></tr>
       <tr><th>说明</th><td>${f.note}</td></tr>
     </tbody></table>
-    <h4>阻塞来源（按等待时间分解）</h4>`;
+    <h4>阻塞来源（合并视图；逐时隙连续归因见下方“流实例等待链复核”）</h4>`;
   if (!f.blockers.length) html += `<p class="meta">无更细粒度阻塞记录。</p>`;
   for (const b of f.blockers) {
     html += `<div class="blocker"><b>${b.type}</b> [${b.from}, ${b.to}) μs：${b.detail}` +
@@ -333,6 +491,13 @@ $("#add-gate").addEventListener("click", () => {
 });
 $("#submit-btn").addEventListener("click", submitSchedule);
 $("#load-btn").addEventListener("click", loadFrozen);
+$("#waitchain-btn").addEventListener("click", loadWaitChain);
+instanceSelect.addEventListener("change", () => {
+  // 切换实例仅清旧链，等待用户显式读取（不改动冻结裁决）。
+  waitBody.replaceChildren();
+  waitError.hidden = true;
+  waitStatus.textContent = "已选择实例，点击“读取等待链”。";
+});
 $("#example-schedulable").addEventListener("click", () => loadForm(EXAMPLES.schedulable));
 $("#example-miss").addEventListener("click", () => loadForm(EXAMPLES.miss));
 $("#example-growth").addEventListener("click", () => loadForm(EXAMPLES.growth));

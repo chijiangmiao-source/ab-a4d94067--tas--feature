@@ -15,7 +15,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from .models import ScheduleRequest
-from .scheduler import adjudicate, canonical_hash
+from .scheduler import (
+    InstanceNotFound,
+    Scheduler,
+    Untraceable,
+    canonical_hash,
+)
 
 
 class ConflictError(Exception):
@@ -33,6 +38,9 @@ class FrozenDecision:
     frozen_at: float
     request: dict[str, Any]
     verdict: dict[str, Any]
+    # 运行结束后只读的模拟引擎，供等待链实例查询按冻结时的连续时隙重建证据；
+    # 不进入 to_json，也不会被查询修改。
+    engine: Any = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -61,13 +69,15 @@ class DecisionStore:
                         req.audit_id, existing.content_hash, content_hash
                     )
                 return existing, False
-            verdict = adjudicate(req)
+            engine = Scheduler(req)
+            verdict = engine.run()
             decision = FrozenDecision(
                 audit_id=req.audit_id,
                 content_hash=content_hash,
                 frozen_at=time.time(),
                 request=req.to_json(),
                 verdict=verdict,
+                engine=engine,
             )
             self._decisions[req.audit_id] = decision
             return decision, True
@@ -75,6 +85,21 @@ class DecisionStore:
     def get(self, audit_id: str) -> FrozenDecision | None:
         with self._lock:
             return self._decisions.get(audit_id)
+
+    def wait_chain(self, audit_id: str, frame: str) -> dict[str, Any]:
+        """对已冻结裁决重建指定实例的连续等待链。
+
+        - 裁决不存在 / 实例从未出现 -> InstanceNotFound；
+        - 证据无法连续覆盖 -> Untraceable。
+        只读访问，不改变任何冻结结果。
+        """
+        with self._lock:
+            decision = self._decisions.get(audit_id)
+        if decision is None or decision.engine is None:
+            raise InstanceNotFound(
+                f"审计标识 {audit_id} 无可追溯的冻结裁决"
+            )
+        return decision.engine.wait_chain(frame)
 
     def list_ids(self) -> list[str]:
         with self._lock:

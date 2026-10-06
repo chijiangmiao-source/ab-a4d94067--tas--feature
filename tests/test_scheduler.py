@@ -3,7 +3,7 @@
 import unittest
 
 from app.models import ValidationError, parse_request
-from app.scheduler import adjudicate
+from app.scheduler import InstanceNotFound, Scheduler, adjudicate, Untraceable
 
 
 def make(audit_id="T", gate_period=1000, flows=None, gates=None):
@@ -290,6 +290,137 @@ class TimelineTests(unittest.TestCase):
         )
         self.assertEqual(v["verdict"], "SCHEDULABLE")
         self.assertEqual(v["flow_evidence"]["A"][0]["finish"], 500)
+
+
+def engine(**kw):
+    req = make(audit_id=kw.pop("audit_id", "T"), **kw)
+    s = Scheduler(req)
+    v = s.run()
+    return s, v
+
+
+class WaitChainTests(unittest.TestCase):
+    def setUp(self):
+        # 与 CARRYOVER 等价：LO#0 [0,400) 被 HI 高优先级先占，[400,1000) 门关闭。
+        self.s, self.v = engine(**CARRYOVER)
+
+    def test_intervals_are_contiguous_and_exhaustive(self):
+        ch = self.s.wait_chain("LO#0")
+        ivs = ch["intervals"]
+        self.assertTrue(ivs)
+        self.assertEqual(ivs[0]["from"], 0)
+        for a, b in zip(ivs, ivs[1:]):
+            self.assertEqual(a["to"], b["from"])          # 连续
+        self.assertEqual(ivs[-1]["to"], 1000)
+        self.assertEqual(sum(i["duration_us"] for i in ivs), 1000)
+        # 无重叠（起止严格单调递增）。
+        for a, b in zip(ivs, ivs[1:]):
+            self.assertLess(a["from"], b["from"])
+
+    def test_distinct_causes_not_merged(self):
+        ch = self.s.wait_chain("LO#0")
+        kinds = [i["blocking_category"] for i in ch["intervals"]]
+        # 高优先级先占与门关闭是相邻但不同的两类，不得合并成同一原因。
+        self.assertEqual(kinds, ["higher_priority_tx", "gate_closed"])
+        hp = ch["intervals"][0]
+        self.assertEqual((hp["from"], hp["to"]), (0, 400))
+        self.assertEqual(hp["source_frame"], "HI#0")
+        self.assertEqual(hp["source_flow"], "HI")
+        self.assertEqual(hp["source_release"], 0)
+        gc = ch["intervals"][1]
+        self.assertEqual((gc["from"], gc["to"]), (400,1000))
+        self.assertIsNone(gc["source_frame"])
+        # 每段都带四类必备证据字段。
+        for iv in ch["intervals"]:
+            for key in ("queue_length", "gate_state", "top_ready_priority",
+                        "blocking_category"):
+                self.assertIn(key, iv)
+
+    def test_window_too_short_is_own_category(self):
+        s, v = engine(
+            gate_period=1000,
+            flows=[
+                {"flow_id": "HI", "priority": 0, "period": 2000,
+                 "transmit_time": 500, "deadline": 2000},
+                {"flow_id": "LO", "priority": 1, "period": 2000,
+                 "transmit_time": 300, "deadline": 1500},
+            ],
+            gates=[
+                {"start": 0, "end": 100, "priorities": [1]},
+                {"start": 100, "end": 600, "priorities": [0]},
+                {"start": 600, "end": 1000, "priorities": [1]},
+            ],
+        )
+        self.assertEqual(v["verdict"], "SCHEDULABLE")
+        kinds = [i["blocking_category"] for i in s.wait_chain("LO#0")["intervals"]]
+        # [0,100) 窗口不足不启动；[100,600) 高优先级先占——两者不得合并。
+        self.assertEqual(kinds[0], "window_too_short")
+        self.assertIn("higher_priority_tx", kinds)
+
+    def test_same_flow_fifo_category(self):
+        s, v = engine(**GROWTH)
+        self.assertEqual(v["verdict"], "NON_CONVERGENT")
+        ch = s.wait_chain("FLOOD#1")
+        self.assertTrue(ch["frame"]["unsent"])
+        for iv in ch["intervals"]:
+            self.assertEqual(iv["blocking_category"], "same_flow_fifo")
+            self.assertEqual(iv["source_frame"], "FLOOD#0")
+            self.assertEqual(iv["source_release"], 0)
+
+    def test_first_overdue_never_started_covers_to_deadline(self):
+        s, v = engine(
+            gate_period=1000,
+            flows=[
+                {"flow_id": "HI", "priority": 0, "period": 1000,
+                 "transmit_time": 600, "deadline": 1000},
+                {"flow_id": "LO", "priority": 1, "period": 2000,
+                 "transmit_time": 300, "deadline": 500},
+            ],
+            gates=[
+                {"start": 0, "end": 600, "priorities": [0]},
+                {"start": 600, "end": 1000, "priorities": [1]},
+            ],
+        )
+        self.assertEqual(v["verdict"], "DEADLINE_MISS")
+        f = v["first_overdue_frame"]
+        self.assertTrue(f["unsent"])
+        self.assertIsNone(f["transmit_start"])
+        self.assertEqual(f["state_when_overdue"], "waiting")
+        ch = s.wait_chain("LO#0")
+        self.assertTrue(ch["frame"]["unsent"])
+        self.assertIsNone(ch["frame"]["transmit_start"])
+        self.assertEqual(ch["coverage"], [0, 500])
+        self.assertEqual(ch["intervals"][-1]["to"], 500)
+        self.assertEqual(sum(i["duration_us"] for i in ch["intervals"]), 500)
+
+    def test_zero_wait_when_sent_immediately(self):
+        ch = self.s.wait_chain("HI#0")
+        self.assertEqual(ch["total_wait_us"], 0)
+        self.assertEqual(ch["intervals"], [])
+        self.assertFalse(ch["frame"]["unsent"])
+
+    def test_missing_instance_raises(self):
+        with self.assertRaises(InstanceNotFound):
+            self.s.wait_chain("LO#999")
+
+    def test_untraceable_instance_raises_and_frozen_intact(self):
+        # FLOOD#2 在证据末端（t=2000）刚释放，等待区间超出连续时隙记录。
+        s, v = engine(**GROWTH)
+        with self.assertRaises(Untraceable):
+            s.wait_chain("FLOOD#2")
+        # 异常不得改写模拟结果：可查实例与裁决仍在。
+        self.assertEqual(v["verdict"], "NON_CONVERGENT")
+        ch0 = s.wait_chain("FLOOD#0")
+        self.assertEqual(ch0["coverage"][1], 1000)
+
+    def test_catalog_lists_appeared_instances(self):
+        catalog = self.v["instances"]
+        fids = [i["frame"] for i in catalog["instances"]]
+        self.assertIn("LO#0", fids)
+        self.assertIn("HI#0", fids)
+        for it in catalog["instances"]:
+            if it["frame"] in ("LO#0", "HI#0"):
+                self.assertTrue(it["queryable"])
 
 
 if __name__ == "__main__":

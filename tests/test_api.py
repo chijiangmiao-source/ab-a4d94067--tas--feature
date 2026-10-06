@@ -151,6 +151,82 @@ class ApiTests(unittest.TestCase):
             chain = body["decision"]["growth_chain"]
             self.assertGreaterEqual(len(chain), 2)
 
+    def test_wait_chain_endpoint_and_errors(self):
+        with HttpServerFixture() as srv:
+            status, body = srv.call("POST", "/api/submit", BASE_PAYLOAD)
+            self.assertEqual(status, 201)
+            h = body["content_hash"]
+            # 裁决体内含实例目录。
+            self.assertIn("instances", body["decision"])
+            self.assertTrue(
+                any(i["frame"] == "A#0"
+                    for i in body["decision"]["instances"]["instances"])
+            )
+
+            # A#0 释放即发送，等待为空的连续链。
+            status, body = srv.call("GET", "/api/decisions/API-001/wait-chain?frame=A%230")
+            self.assertEqual(status, 200)
+            ch = body["wait_chain"]
+            self.assertEqual(ch["coverage"], [0, 0])
+            self.assertEqual(ch["total_wait_us"], 0)
+            self.assertEqual(body["content_hash"], h)
+
+            # 未带 frame -> 400。
+            status, body = srv.call("GET", "/api/decisions/API-001/wait-chain")
+            self.assertEqual(status, 400)
+            self.assertEqual(body["error"], "BAD_REQUEST")
+
+            # 从未出现的实例 -> 404 INSTANCE_NOT_FOUND。
+            status, body = srv.call(
+                "GET", "/api/decisions/API-001/wait-chain?frame=ZZ%239"
+            )
+            self.assertEqual(status, 404)
+            self.assertEqual(body["error"], "INSTANCE_NOT_FOUND")
+
+            # 未知裁决 -> 404 NOT_FOUND。
+            status, body = srv.call(
+                "GET", "/api/decisions/NOPE/wait-chain?frame=A%230"
+            )
+            self.assertEqual(status, 404)
+            self.assertEqual(body["error"], "NOT_FOUND")
+
+            # 错误查询不改写冻结裁决。
+            status, body = srv.call("GET", "/api/decisions/API-001")
+            self.assertEqual(status, 200)
+            self.assertEqual(body["content_hash"], h)
+
+    def test_wait_chain_contiguous_segments_via_api(self):
+        with HttpServerFixture() as srv:
+            payload = {
+                "audit_id": "API-WC",
+                "gate_period": 1000,
+                "flows": [
+                    {"flow_id": "HI", "priority": 0, "period": 2000,
+                     "transmit_time": 400, "deadline": 2000},
+                    {"flow_id": "LO", "priority": 1, "period": 2000,
+                     "transmit_time": 400, "deadline": 2000},
+                ],
+                "gate_entries": [{"start": 0, "end": 400, "priorities": [0, 1]}],
+            }
+            srv.call("POST", "/api/submit", payload)
+            status, body = srv.call(
+                "GET", "/api/decisions/API-WC/wait-chain?frame=LO%230"
+            )
+            self.assertEqual(status, 200)
+            ivs = body["wait_chain"]["intervals"]
+            self.assertGreater(len(ivs), 1)
+            for a, b in zip(ivs, ivs[1:]):
+                self.assertEqual(a["to"], b["from"])   # 连续无重叠
+            self.assertEqual(ivs[0]["from"], 0)
+            self.assertEqual(ivs[-1]["to"], 1000)
+            kinds = {i["blocking_category"] for i in ivs}
+            self.assertIn("higher_priority_tx", kinds)
+            self.assertIn("gate_closed", kinds)
+            # 占用段必须关联来源帧与释放时刻。
+            hp = next(i for i in ivs if i["blocking_category"] == "higher_priority_tx")
+            self.assertEqual(hp["source_frame"], "HI#0")
+            self.assertEqual(hp["source_release"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

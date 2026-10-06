@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from .models import ValidationError, parse_request
+from .scheduler import InstanceNotFound, Untraceable
 from .store import ConflictError, DecisionStore
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -60,6 +61,11 @@ def make_handler(store: DecisionStore) -> type[BaseHTTPRequestHandler]:
                 self._serve_static(unquote(name))
             elif path == "/api/health":
                 self._json({"ok": True, "frozen_ids": store.list_ids()})
+            elif path.startswith("/api/decisions/") and path.endswith("/wait-chain"):
+                self._serve_wait_chain(
+                    unquote(path[len("/api/decisions/"): -len("/wait-chain")]),
+                    parsed.query,
+                )
             elif path.startswith("/api/decisions/"):
                 audit_id = unquote(path[len("/api/decisions/"):])
                 decision = store.get(audit_id)
@@ -69,6 +75,45 @@ def make_handler(store: DecisionStore) -> type[BaseHTTPRequestHandler]:
                     self._json({"ok": True, **decision.to_json()})
             else:
                 self._error(404, "NOT_FOUND", "资源不存在")
+
+        def _serve_wait_chain(self, audit_id: str, query: str) -> None:
+            from urllib.parse import parse_qs
+
+            frame = (parse_qs(query).get("frame") or [""])[0].strip()
+            if not frame:
+                self._error(400, "BAD_REQUEST", "必须通过 frame 指定已出现的流实例，如 LO#0")
+                return
+            if store.get(audit_id) is None:
+                self._error(404, "NOT_FOUND", f"审计标识 {audit_id} 尚无冻结裁决")
+                return
+            try:
+                chain = store.wait_chain(audit_id, frame)
+            except InstanceNotFound as exc:
+                # 裁决存在但实例从未出现：明确错误，且不改写冻结结果。
+                self._error(
+                    404,
+                    "INSTANCE_NOT_FOUND",
+                    str(exc),
+                    {"audit_id": audit_id, "frame": frame},
+                )
+                return
+            except Untraceable as exc:
+                self._error(
+                    422,
+                    "UNTRACEABLE",
+                    str(exc),
+                    {"audit_id": audit_id, "frame": frame},
+                )
+                return
+            self._json(
+                {
+                    "ok": True,
+                    "audit_id": audit_id,
+                    "content_hash": store.get(audit_id).content_hash,
+                    "frozen": True,
+                    "wait_chain": chain,
+                }
+            )
 
         def do_POST(self) -> None:  # noqa: N802
             path = urlparse(self.path).path

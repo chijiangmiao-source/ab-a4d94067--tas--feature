@@ -91,3 +91,23 @@ input:focus { outline: none; border-color: #38bdf8; }
   margin: 6px 0; border-radius: 4px; font-size: 13px; font-family: ui-monospace, monospace; }
 .paginator { margin-top: 8px; display: flex; gap: 10px; align-items: center; }
 .paginator select, .paginator button { font-size: 12px; }
+.waitchain-panel {
+  margin-top: 16px; padding-top: 14px; border-top: 1px dashed #475569;
+}
+.waitchain-panel h3 { margin-top: 4px; color: #7dd3fc; }
+.waitchain-panel label { flex-direction: row; align-items: center; gap: 6px; }
+#instance-select {
+  background: #0f172a; color: #e2e8f0; border: 1px solid #475569;
+  border-radius: 6px; padding: 7px 10px; font-size: 13px; min-width: 420px;
+}
+#instance-select option:disabled { color: #64748b; }
+.wc-head h4 { margin: 8px 0 4px; color: #7dd3fc; font-size: 14px; }
+.wc-table { width: 100%; border-collapse: collapse; font-size: 12px; margin: 8px 0; }
+.wc-table th, .wc-table td { border: 1px solid #334155; padding: 5px 7px; vertical-align: top; }
+.wc-table th { background: #0f172a; color: #94a3b8; position: sticky; top: 0; }
+.cat-badge { white-space: nowrap; font-weight: 600; padding: 2px 7px; border-radius: 999px; font-size: 11px; }
+.cat-gate_closed { background: #78350f; color: #fde68a; }
+.cat-window_too_short { background: #713f12; color: #fef08a; }
+.cat-higher_priority_tx { background: #7f1d1d; color: #fecaca; }
+.cat-nonpreemptive_hold { background: #581c87; color: #e9d5ff; }
+.cat-same_flow_fifo { background: #0c4a6e; color: #bae6fd; }

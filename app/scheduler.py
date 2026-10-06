@@ -9,6 +9,16 @@
   追加在未发送帧之后（FIFO），绝不覆盖未发送帧。
 - 完成时刻 <= release+deadline 视为按期；在截止时刻仍未完成即为超期。
 
+等待链归因（wait_chain）：在模拟过程中依托逐时隙状态记录，把某个实例
+[释放, 开始发送) 或 [释放, 截止期) 的等待切成按时间连续、互不重叠的区间，
+每段给出唯一阻塞类别：
+- gate_closed        ：本优先级门未开，关闭门后等待下一窗口；
+- window_too_short   ：门已开但窗口剩余不足以完整发送，不启动；
+- higher_priority_tx ：更高优先级帧非抢占先占单出口；
+- nonpreemptive_hold ：其他帧非抢占占用出口（含跨周期遗留占用）；
+- same_flow_fifo     ：同流 FIFO 前序实例未完成，本实例不能超越。
+门关闭、窗口不足与高优先级先占是不同机制，相邻但不同类的区间绝不合并。
+
 裁决优先级：
 1. 连续两个超周期（hyperperiod）边界遗留队列严格增长 -> NON_CONVERGENT，
    以队列增长证据拒绝（释放与门控在超周期内稳态重复，增长必然无界）；
@@ -31,8 +41,16 @@ from .models import ScheduleRequest
 
 MAX_GATE_CYCLES = 4000          # 模拟门控周期数硬上限，防止无界运行
 MAX_SEGMENTS = 20000            # 逐时隙记录上限，控制冻结结论载荷
+MAX_WAIT_CHAIN = 20000          # 单实例等待链区间上限，控制证据载荷
 GROWTH_CONFIRMATIONS = 2        # 超周期边界连续增长两次即确认无法收敛
 DRAIN_PROOFS_NEEDED = 2         # 连续两个超周期边界排空才判定可调度
+
+# 等待区间类别（顺序即归因判定优先级，互斥且不合并）。
+CAT_GATE_CLOSED = "gate_closed"
+CAT_WINDOW_TOO_SHORT = "window_too_short"
+CAT_HIGHER_TX = "higher_priority_tx"
+CAT_HOLD = "nonpreemptive_hold"
+CAT_FIFO = "same_flow_fifo"
 
 
 def lcm(a: int, b: int) -> int:
@@ -50,6 +68,8 @@ class Frame:
     status: str = "queued"       # queued | sending | sent | late
     start: int | None = None
     finish: int | None = None
+    # 截止期到来时尚未开始发送（在队等待中超期）：等待证据精确覆盖至截止期。
+    overdue_unsent: bool = False
 
     @property
     def fid(self) -> str:
@@ -74,6 +94,14 @@ class _Bound:
     before_release: bool = True
 
 
+class InstanceNotFound(LookupError):
+    """等待链查询指向裁决中从未出现（释放）的实例。"""
+
+
+class Untraceable(RuntimeError):
+    """实例已出现，但模拟证据无法连续覆盖其等待区间。"""
+
+
 class Scheduler:
     def __init__(self, req: ScheduleRequest):
         self.req = req
@@ -91,8 +119,12 @@ class Scheduler:
         self.H = h
 
         self.queues: dict[int, list[Frame]] = {f.priority: [] for f in req.flows}
+        self.prio_order = sorted(self.queues)
         self.next_seq: dict[str, int] = {f.flow_id: 0 for f in req.flows}
         self.in_flight: Frame | None = None
+
+        # 所有已释放实例的注册表（fid -> Frame），供等待链查询追溯。
+        self.frames: dict[str, Frame] = {}
 
         self.segments: list[Segment] = []
         self.events: list[dict[str, Any]] = []
@@ -259,6 +291,7 @@ class Scheduler:
                 )
                 # 追加在同流未发送帧之后，不覆盖任何旧帧。
                 self.queues[f.priority].append(frame)
+                self.frames[frame.fid] = frame
                 self.next_seq[f.flow_id] = seq + 1
                 self.events.append(
                     {
@@ -338,6 +371,10 @@ class Scheduler:
     def _mark_late(self, t: int) -> None:
         for frame in self._active_frames():
             if frame.status in ("queued", "sending") and frame.deadline_abs <= t:
+                if frame.status == "queued":
+                    # 截止期到来时仍在队等待：首个超期且尚未开始发送，
+                    # 其等待证据必须精确覆盖至截止期并标明未发送。
+                    frame.overdue_unsent = True
                 frame.status = "late"
                 self.late_frames.append(frame)
                 if self.first_late is None:
@@ -400,78 +437,330 @@ class Scheduler:
             )
             return
 
-    # ---- 阻塞来源分析 ----
+    # ---- 等待链归因（基于连续时隙重建） ----
 
-    def _blockers_for(self, frame: Frame, until: int) -> list[dict[str, Any]]:
-        """分析帧在 [release, until) 内未能按时发送的阻塞来源。"""
-        blockers: list[dict[str, Any]] = []
-        start_limit = frame.start if frame.start is not None else until
+    def _head_of(self, seg: Segment, p: int) -> str | None:
+        q = seg.queues.get(str(p), [])
+        return q[0] if q else None
+
+    def _top_ready_priority(
+        self, seg: Segment, s: int, gate: frozenset[int]
+    ) -> int | None:
+        """当前时隙真正可启动发送的最高优先级。
+
+        单出口被非抢占占用期间没有任何帧能启动 -> None；空闲时按严格优先级，
+        取门开放、位于队首且窗口剩余放得下的最高（数值最小）优先级。
+        """
+        if seg.transmitting is not None:
+            return None
+        for p in self.prio_order:
+            fid = self._head_of(seg, p)
+            if fid is None or p not in gate:
+                continue
+            remain = self._window_end_at(s, p) - s
+            if remain >= self.frames[fid].transmit_time:
+                return p
+        return None
+
+    def _classify(
+        self,
+        frame: Frame,
+        seg: Segment,
+        s: int,
+        gate: frozenset[int],
+    ) -> tuple[str, str | None, str | None, int | None, str]:
+        """返回 (类别, 关联帧, 关联流, 关联帧释放时刻, 说明)。
+
+        归因互斥，顺序与模拟决策一致：启动逻辑只在链路空闲时运行，故一旦有
+        其他帧非抢占发送，出口占用即直接约束（高优先级先占 / 同流前序发送 /
+        跨周期占用）；链路空闲时再依次判定同流排队、门关闭、窗口不足。
+        门关闭、窗口不足与高优先级先占因此永远不会被合并成同一原因。
+        """
+        tx = seg.transmitting
+        own_q = seg.queues.get(str(frame.priority), [])
+        pos = own_q.index(frame.fid) if frame.fid in own_q else -1
+
+        def tx_ref() -> tuple[str, str, int | None]:
+            src = self.frames.get(tx["frame"])  # type: ignore[index]
+            return (
+                tx["frame"],  # type: ignore[index]
+                tx["flow_id"],  # type: ignore[index]
+                src.release if src is not None else None,
+            )
+
+        # 1) 出口被其他帧非抢占占用（启动逻辑此时根本不会运行）。
+        if tx is not None and tx["frame"] != frame.fid:
+            src_fid, src_flow, src_rel = tx_ref()
+            if tx["priority"] < frame.priority:  # type: ignore[index]
+                return (
+                    CAT_HIGHER_TX,
+                    src_fid,
+                    src_flow,
+                    src_rel,
+                    f"更高优先级帧 {src_fid}（P{tx['priority']}）非抢占先占单出口",  # type: ignore[index]
+                )
+            if tx["priority"] == frame.priority:  # type: ignore[index]
+                # 优先级在流间唯一：同优先级占用帧即同流前序实例（FIFO）。
+                return (
+                    CAT_FIFO,
+                    src_fid,
+                    src_flow,
+                    src_rel,
+                    f"同流 FIFO 前序帧 {src_fid} 正在非抢占发送，本帧不得超越",
+                )
+            return (
+                CAT_HOLD,
+                src_fid,
+                src_flow,
+                src_rel,
+                f"帧 {src_fid} 非抢占占用出口（含跨周期遗留占用），本帧等待其发完",
+            )
+        # 2) 链路空闲：同流前序实例仍排在本帧之前（FIFO，绝不覆盖/超越）。
+        if pos > 0:
+            head_fid = own_q[0]
+            head = self.frames.get(head_fid)
+            return (
+                CAT_FIFO,
+                head_fid,
+                head.flow_id if head is not None else frame.flow_id,
+                head.release if head is not None else None,
+                f"同流 FIFO：前序帧 {head_fid} 尚未完成，本帧排队其后不得覆盖",
+            )
+        # 3) 本优先级门关闭：关闭后只能等待下一开放窗口。
+        if frame.priority not in gate:
+            return (
+                CAT_GATE_CLOSED,
+                None,
+                None,
+                None,
+                f"优先级 {frame.priority} 的门控项关闭，等待下一开放窗口",
+            )
+        # 4) 开放窗口剩余不足以完整发送：不启动，继续等待。
+        remain = self._window_end_at(s, frame.priority) - s
+        if remain < frame.transmit_time:
+            return (
+                CAT_WINDOW_TOO_SHORT,
+                None,
+                None,
+                None,
+                f"门窗口剩余 {remain}us 小于发送时长 {frame.transmit_time}us，"
+                "无法完整发送故不启动",
+            )
+        # 门开、窗口足、链路空闲且本帧为队首，却仍在等待：与模拟语义矛盾，
+        # 证据不可追溯，交由上层报明确错误而不是编造原因。
+        raise Untraceable(f"{frame.fid} 在 {s}us 满足全部启动条件却仍等待")
+
+    def wait_chain(self, fid: str) -> dict[str, Any]:
+        """为已出现实例重建 [释放, 开始发送)（未开始则到截止期）的等待链。
+
+        区间按时间连续、互不重叠；每段带队列长度、门状态、可发送最高优先级、
+        阻塞类别及占用/同流 FIFO 关联帧。首个超期且未开始的帧证据精确覆盖
+        至截止期并标明未发送。
+        """
+        frame = self.frames.get(fid)
+        if frame is None:
+            raise InstanceNotFound(f"实例 {fid} 从未在裁决模拟中释放出现")
+
+        # 截止期到来时尚未开始发送的帧：即便其后被继续服务，等待证据也只
+        # 精确覆盖至截止期，并标明“未发送”。
+        unsent = frame.overdue_unsent or frame.start is None
+        if frame.overdue_unsent:
+            wait_end = frame.deadline_abs
+        else:
+            wait_end = frame.start if frame.start is not None else frame.deadline_abs
+        gate_priority = frame.priority
+
+        intervals: list[dict[str, Any]] = []
+        covered_from: int | None = None
+        covered_to: int | None = None
+        cat_totals: dict[str, int] = {}
+
         for seg in self.segments:
+            if seg.end <= frame.release or seg.start >= wait_end:
+                continue
             s = max(seg.start, frame.release)
-            e = min(seg.end, start_limit)
+            e = min(seg.end, wait_end)
             if s >= e:
                 continue
-            tx = seg.transmitting
-            if tx is not None and tx["frame"] != frame.fid and tx["priority"] < frame.priority:
-                blockers.append(
-                    {
-                        "type": "higher_priority_tx",
-                        "from": s,
-                        "to": e,
-                        "source_frame": tx["frame"],
-                        "source_flow": tx["flow_id"],
-                        "source_priority": tx["priority"],
-                        "detail": "高优先级帧非抢占占用单出口",
-                    }
+            gate = frozenset(seg.gate_open)
+            own_q = seg.queues.get(str(frame.priority), [])
+            if unsent and frame.fid not in own_q and s < frame.deadline_abs:
+                # 截止期前未开始的帧必须始终在队；缺失即证据链断裂。
+                raise Untraceable(
+                    f"{fid} 在 [{s},{e}) 时隙不在 P{frame.priority} 队列中"
                 )
-            elif tx is not None and tx["frame"] != frame.fid:
-                blockers.append(
-                    {
-                        "type": "nonpreemptive_hold",
-                        "from": s,
-                        "to": e,
-                        "source_frame": tx["frame"],
-                        "source_flow": tx["flow_id"],
-                        "source_priority": tx["priority"],
-                        "detail": "帧发送中，非抢占规则下跨周期遗留占用链路",
-                    }
+            category, src_fid, src_flow, src_rel, detail = self._classify(
+                frame, seg, s, gate
+            )
+            top_ready = self._top_ready_priority(seg, s, gate)
+            queue_len = sum(len(q) for q in seg.queues.values())
+            position = own_q.index(frame.fid) + 1 if frame.fid in own_q else None
+            duration = e - s
+            cat_totals[category] = cat_totals.get(category, 0) + duration
+            intervals.append(
+                {
+                    "index": len(intervals),
+                    "from": s,
+                    "to": e,
+                    "duration_us": duration,
+                    "queue_length": queue_len,
+                    "queue_position": position,
+                    "gate_state": "open" if gate_priority in gate else "closed",
+                    "gate_open": list(seg.gate_open),
+                    "top_ready_priority": top_ready,
+                    "blocking_category": category,
+                    "source_frame": src_fid,
+                    "source_flow": src_flow,
+                    "source_release": src_rel,
+                    "detail": detail,
+                }
+            )
+            covered_from = s if covered_from is None else min(covered_from, s)
+            covered_to = e if covered_to is None else max(covered_to, e)
+
+        if not unsent and frame.start == frame.release:
+            # 释放即获得出口：等待为空，仍返回结构完整、连续无重叠的空链。
+            return {
+                "frame": self._frame_block(frame, False),
+                "coverage": [frame.release, wait_end],
+                "coverage_note": "实例释放时刻即开始发送，等待为空",
+                "total_wait_us": 0,
+                "duration_by_category": {},
+                "intervals": [],
+            }
+        if not intervals or covered_from != frame.release or covered_to != wait_end:
+            got = (
+                "无任何时隙覆盖"
+                if covered_from is None
+                else f"实际覆盖 [{covered_from},{covered_to})"
+            )
+            raise Untraceable(
+                f"{fid} 等待证据无法连续覆盖 [{frame.release},{wait_end})，{got}"
+            )
+        # 连续性与无重叠自检：区间由连续时隙裁剪而来，首尾必须严格相接。
+        for a, b in zip(intervals, intervals[1:]):
+            if a["to"] != b["from"]:
+                raise Untraceable(
+                    f"{fid} 等待链在 {a['to']}us 处不连续（下段起 {b['from']}）"
                 )
-            elif frame.priority not in seg.gate_open:
-                blockers.append(
-                    {
-                        "type": "gate_closed",
-                        "from": s,
-                        "to": e,
-                        "detail": f"优先级 {frame.priority} 的门控项未开放",
-                    }
-                )
+
+        return {
+            "frame": self._frame_block(frame, unsent),
+            "coverage": [frame.release, wait_end],
+            "coverage_note": (
+                "证据自释放连续覆盖至截止期；该帧截止期前始终未开始发送"
+                if unsent
+                else "证据自释放连续覆盖至实际开始发送时刻"
+            ),
+            "total_wait_us": wait_end - frame.release,
+            "duration_by_category": cat_totals,
+            "intervals": intervals,
+        }
+
+    def _frame_block(self, frame: Frame, unsent: bool) -> dict[str, Any]:
+        """等待链中的实例口径：未在截止期前开始发送时起止一律记 None。"""
+        if unsent:
+            state = (
+                "overdue_waiting_unsent" if frame.overdue_unsent
+                else "waiting_unsent"
+            )
+            return {
+                "frame": frame.fid,
+                "flow_id": frame.flow_id,
+                "priority": frame.priority,
+                "seq": frame.seq,
+                "release": frame.release,
+                "enqueue": frame.release,
+                "deadline": frame.deadline_abs,
+                "transmit_start": None,
+                "transmit_end": None,
+                "state": state,
+                "unsent": True,
+            }
+        return {
+            "frame": frame.fid,
+            "flow_id": frame.flow_id,
+            "priority": frame.priority,
+            "seq": frame.seq,
+            "release": frame.release,
+            "enqueue": frame.release,
+            "deadline": frame.deadline_abs,
+            "transmit_start": frame.start,
+            "transmit_end": frame.finish,
+            "state": "sent" if frame.status == "sent" else frame.status,
+            "unsent": False,
+        }
+
+    def instance_catalog(self, limit: int = MAX_WAIT_CHAIN) -> dict[str, Any]:
+        """枚举模拟中已出现（释放）的流实例，供页面选择与接口校验。
+
+        queryable 表示其等待区间完整落在已记录的连续时隙证据内，
+        等待链接口可给出连续覆盖；否则接口将返回不可追溯错误而非编造。
+        """
+        trace_end = self.segments[-1].end if self.segments else 0
+        items: list[dict[str, Any]] = []
+        truncated = False
+        for fid in sorted(self.frames, key=lambda x: (self.frames[x].release, x)):
+            fr = self.frames[fid]
+            if fr.release > trace_end:
+                continue
+            if len(items) >= limit:
+                truncated = True
+                break
+            if fr.overdue_unsent:
+                wait_end = fr.deadline_abs
             else:
-                close = self._window_end_at(s, frame.priority)
-                remain = close - s
-                if remain < frame.transmit_time:
-                    blockers.append(
-                        {
-                            "type": "window_too_short",
-                            "from": s,
-                            "to": e,
-                            "detail": (
-                                f"门窗口剩余 {remain}us 小于发送时长 "
-                                f"{frame.transmit_time}us，无法完整发送，继续等待"
-                            ),
-                        }
-                    )
-        # 合并相邻同类且同源记录，便于页面阅读。
+                wait_end = fr.start if fr.start is not None else fr.deadline_abs
+            items.append(
+                {
+                    "frame": fid,
+                    "flow_id": fr.flow_id,
+                    "priority": fr.priority,
+                    "seq": fr.seq,
+                    "release": fr.release,
+                    "deadline": fr.deadline_abs,
+                    "transmit_start": fr.start,
+                    "transmit_end": fr.finish,
+                    "status": fr.status,
+                    "unsent": fr.start is None,
+                    "queryable": wait_end <= trace_end,
+                }
+            )
+        return {
+            "instances": items,
+            "truncated": truncated,
+            "total": len(self.frames),
+            "trace_end": trace_end,
+        }
+
+    def _legacy_blockers(self, chain: dict[str, Any]) -> list[dict[str, Any]]:
+        """由等待链区间派生旧版 blockers 视图（仅合并相邻同类同源段）。"""
         merged: list[dict[str, Any]] = []
-        for b in blockers:
+        for iv in chain["intervals"]:
             if (
                 merged
-                and merged[-1]["type"] == b["type"]
-                and merged[-1]["to"] == b["from"]
-                and merged[-1].get("source_frame") == b.get("source_frame")
+                and merged[-1]["type"] == iv["blocking_category"]
+                and merged[-1]["to"] == iv["from"]
+                and merged[-1].get("source_frame") == iv["source_frame"]
             ):
-                merged[-1]["to"] = b["to"]
+                merged[-1]["to"] = iv["to"]
                 continue
-            merged.append(dict(b))
+            merged.append(
+                {
+                    "type": iv["blocking_category"],
+                    "from": iv["from"],
+                    "to": iv["to"],
+                    "source_frame": iv["source_frame"],
+                    "source_flow": iv["source_flow"],
+                    "source_priority": (
+                        self.frames[iv["source_frame"]].priority
+                        if iv["source_frame"] is not None
+                        and iv["source_frame"] in self.frames
+                        else None
+                    ),
+                    "detail": iv["detail"],
+                }
+            )
         return merged
 
     # ---- 裁决组装 ----
@@ -497,11 +786,19 @@ class Scheduler:
             ],
             "events": [e for e in self.events if e["t"] <= proof_end],
             "timeline": self._timeline(proof_end),
+            "instances": self.instance_catalog(),
         }
 
     def _verdict_miss(self, frame: Frame, at_t: int) -> dict[str, Any]:
-        blockers = self._blockers_for(frame, at_t)
-        started_then_late = frame.start is not None and frame.status == "late"
+        # 截止期时刻是否已开始发送：overdue_unsent 记录的是“截止期到来时仍在
+        # 队等待、从未开始”。即便该帧之后被继续服务，超期证据也以截止期时刻
+        # 为准，精确覆盖至截止期并标明未发送。
+        unsent_at_deadline = frame.overdue_unsent
+        started_then_late = frame.start is not None and not unsent_at_deadline
+        # 等待链按模拟时记录的连续时隙重建：已开始则覆盖到开始发送时刻，
+        # 未开始则精确覆盖至截止期并标明未发送。
+        chain = self.wait_chain(frame.fid)
+        blockers = self._legacy_blockers(chain)
         return {
             "verdict": "DEADLINE_MISS",
             "summary": f"首个超期帧 {frame.fid} 在 {frame.deadline_abs}us 超出截止期",
@@ -512,20 +809,21 @@ class Scheduler:
                 "seq": frame.seq,
                 "release": frame.release,
                 "enqueue": frame.release,
-                "transmit_start": frame.start,
+                "transmit_start": None if unsent_at_deadline else frame.start,
                 "transmit_end": frame.finish if started_then_late else None,
                 "deadline": frame.deadline_abs,
                 "detected_at": frame.deadline_abs,
-                "state_when_overdue": (
-                    "transmitting" if frame.start is not None else "waiting"
-                ),
+                "state_when_overdue": "waiting" if unsent_at_deadline else "transmitting",
+                "unsent": unsent_at_deadline,
                 "note": (
-                    "帧已开始发送但非抢占发送越过截止期"
-                    if started_then_late
-                    else "帧在截止时刻仍未获得完整发送窗口"
+                    "帧在截止时刻仍未获得完整发送窗口、尚未开始发送"
+                    if unsent_at_deadline
+                    else "帧已开始发送但非抢占发送越过截止期"
                 ),
                 "blockers": blockers,
+                "wait_chain": chain,
             },
+            "instances": self.instance_catalog(),
             "events": [e for e in self.events if e["t"] <= at_t],
             "timeline": self._timeline(at_t),
             "boundary_samples": [
@@ -552,11 +850,13 @@ class Scheduler:
                     "release": fr.release,
                     "deadline": fr.deadline_abs,
                     "transmit_start": fr.start,
+                    "unsent": fr.overdue_unsent or fr.start is None,
                 }
                 for fr in self.late_frames
             ],
             "events": self.events,
             "timeline": self._timeline(end_t),
+            "instances": self.instance_catalog(),
         }
 
     def _timeline(self, end: int) -> list[dict[str, Any]]:
